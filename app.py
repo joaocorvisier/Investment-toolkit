@@ -184,7 +184,7 @@ def get_fundamentus_data() -> pd.DataFrame:
     }
     resp = requests.get(url, headers=headers, timeout=30)
     resp.encoding = "ISO-8859-1"
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table", {"id": "resultado"})
     if not table:
         return pd.DataFrame()
