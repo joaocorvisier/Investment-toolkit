@@ -810,8 +810,11 @@ elif page == "📈 Painel Macro":
         "Inadimplência (%)": 20714,
     }
 
-    with st.spinner("Carregando dados do Banco Central..."):
-        df_macro = get_macro_series(series_config, start_date)
+    if st.button("📊 Carregar dados macro", key="load_macro"):
+        with st.spinner("Carregando dados do Banco Central..."):
+            st.session_state["data_macro"] = get_macro_series(series_config, start_date)
+
+    df_macro = st.session_state.get("data_macro", pd.DataFrame())
 
     if not df_macro.empty:
         # Métricas do último ponto
@@ -910,8 +913,11 @@ elif page == "📈 Painel Macro":
     st.markdown("---")
     st.markdown("### Expectativas de Mercado (Focus)")
 
-    with st.spinner("Carregando Focus..."):
-        df_focus = get_focus_data()
+    if st.button("📊 Carregar Focus", key="load_focus"):
+        with st.spinner("Carregando Focus..."):
+            st.session_state["data_focus"] = get_focus_data()
+
+    df_focus = st.session_state.get("data_focus", pd.DataFrame())
 
     if not df_focus.empty:
         # Medianas mais recentes
@@ -932,7 +938,8 @@ elif page == "📈 Painel Macro":
             if fig:
                 st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Não foi possível carregar dados do Focus.")
+        if "data_focus" in st.session_state:
+            st.info("Não foi possível carregar dados do Focus.")
 
 
 # =============================================================================
@@ -1522,7 +1529,7 @@ elif page == "🌍 Mercado Hoje":
     def get_market_data(tickers_dict):
         """Busca preços e calcula variações para uma watchlist."""
         today = datetime.now()
-        start_3y = today - timedelta(days=3 * 365 + 30)
+        start_3y = today - timedelta(days=400)  # ~13 meses (cobre 1A com margem)
 
         # Download all tickers at once
         symbols = list(tickers_dict.values())
@@ -1581,7 +1588,6 @@ elif page == "🌍 Mercado Hoje":
                 "1M (%)": pct_change(30),
                 "YTD (%)": ytd_pct,
                 "1A (%)": pct_change(365),
-                "3A (%)": pct_change(3 * 365),
             })
 
         return pd.DataFrame(results), ""
@@ -1606,12 +1612,26 @@ elif page == "🌍 Mercado Hoje":
             return f"{val:,.4f}"
 
     def show_watchlist(name, tickers):
-        """Exibe uma watchlist com métricas e tabela."""
-        with st.spinner(f"Carregando {name}..."):
-            df, err = get_market_data(tickers)
+        """Exibe uma watchlist com métricas e tabela — carrega sob demanda."""
+        if st.button(f"📊 Carregar {name}", key=f"load_{name}"):
+            with st.spinner(f"Carregando {name}..."):
+                df, err = get_market_data(tickers)
+
+            if df.empty:
+                st.warning(f"Não foi possível carregar dados. {err}")
+                return
+
+            # Salvar no session_state para não perder ao interagir
+            st.session_state[f"data_{name}"] = df
+
+        # Mostrar dados se já carregados
+        df = st.session_state.get(f"data_{name}")
+        if df is None:
+            st.info("Clique no botão acima para carregar os dados.")
+            return
 
         if df.empty:
-            st.warning(f"Não foi possível carregar dados. {err}")
+            st.warning("Nenhum dado disponível.")
             return
 
         # Formatar para exibição
@@ -1621,7 +1641,7 @@ elif page == "🌍 Mercado Hoje":
         display["Preço"] = display["Preço"].apply(format_price)
 
         # Formatar percentuais com cores via HTML
-        pct_cols = ["1D (%)", "1M (%)", "YTD (%)", "1A (%)", "3A (%)"]
+        pct_cols = ["1D (%)", "1M (%)", "YTD (%)", "1A (%)"]
         for col in pct_cols:
             display[col] = display[col].apply(
                 lambda x: f"{x:+.2f}%" if pd.notna(x) and x is not None else "—"
@@ -1739,10 +1759,12 @@ elif page == "🌍 Mercado Hoje":
                 return df
             return pd.DataFrame()
 
-        with st.spinner("Calculando composição setorial..."):
-            df_ibov = get_ibov_sector_weights()
+        if st.button("📊 Carregar Composição IBOV", key="load_ibov"):
+            with st.spinner("Calculando composição setorial..."):
+                st.session_state["data_ibov"] = get_ibov_sector_weights()
 
-        if not df_ibov.empty:
+        df_ibov = st.session_state.get("data_ibov")
+        if df_ibov is not None and not df_ibov.empty:
             c1, c2 = st.columns([1, 1])
             with c1:
                 fig_pie = go.Figure(data=[go.Pie(
@@ -1761,7 +1783,10 @@ elif page == "🌍 Mercado Hoje":
             with c2:
                 st.dataframe(df_ibov, use_container_width=True, hide_index=True)
         else:
-            st.caption("⚠️ Não foi possível calcular composição setorial")
+            if df_ibov is None:
+                st.info("Clique no botão acima para carregar os dados.")
+            else:
+                st.caption("⚠️ Não foi possível calcular composição setorial")
 
     # ─── Tab Gráfico de Preço ────────────────────────────────────────────
 
@@ -1780,7 +1805,7 @@ elif page == "🌍 Mercado Hoje":
         with c3:
             chart_type = st.selectbox("Tipo", ["Linha", "Candlestick"], key="price_chart_type")
 
-        if chart_ticker:
+        if chart_ticker and st.button("📊 Carregar gráfico", key="load_price_chart"):
             @st.cache_data(ttl=3600, show_spinner=False)
             def get_price_data(ticker, period):
                 try:
@@ -1794,44 +1819,60 @@ elif page == "🌍 Mercado Hoje":
                 df_price = get_price_data(chart_ticker, period_map[period_label])
 
             if not df_price.empty:
-                close = df_price["Close"]
-                if isinstance(close, pd.DataFrame):
-                    close = close.iloc[:, 0]
-                close = close.dropna()
+                st.session_state["price_data"] = df_price
+                st.session_state["price_ticker"] = chart_ticker
+                st.session_state["price_period_label"] = period_label
+                st.session_state["price_chart_type_val"] = chart_type
+            else:
+                st.session_state["price_data"] = None
+                st.warning(f"Ticker '{chart_ticker}' não encontrado. Verifique o formato (BR: adicione .SA)")
 
-                if len(close) > 1:
-                    last = close.iloc[-1]
-                    first = close.iloc[0]
-                    var_pct = ((last - first) / first) * 100
-                    high = close.max()
-                    low = close.min()
+        # Render stored data
+        df_price = st.session_state.get("price_data")
+        if df_price is not None and not df_price.empty:
+            _ticker = st.session_state.get("price_ticker", "")
+            _period = st.session_state.get("price_period_label", "")
+            _ctype = st.session_state.get("price_chart_type_val", "Linha")
 
-                    mc1, mc2, mc3, mc4 = st.columns(4)
-                    with mc1:
-                        st.metric("Último", f"{last:,.2f}", delta=f"{var_pct:+.2f}% no período")
-                    with mc2:
-                        st.metric("Máxima", f"{high:,.2f}")
-                    with mc3:
-                        st.metric("Mínima", f"{low:,.2f}")
-                    with mc4:
-                        st.metric("Variação", f"{var_pct:+.2f}%")
+            close = df_price["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close = close.dropna()
 
-                fig_price = go.Figure()
+            if len(close) > 1:
+                last = close.iloc[-1]
+                first = close.iloc[0]
+                var_pct = ((last - first) / first) * 100
+                high = close.max()
+                low = close.min()
 
-                if chart_type == "Candlestick" and "Open" in df_price.columns:
-                    open_col = df_price["Open"].iloc[:, 0] if isinstance(df_price["Open"], pd.DataFrame) else df_price["Open"]
-                    high_col = df_price["High"].iloc[:, 0] if isinstance(df_price["High"], pd.DataFrame) else df_price["High"]
-                    low_col = df_price["Low"].iloc[:, 0] if isinstance(df_price["Low"], pd.DataFrame) else df_price["Low"]
-                    fig_price.add_trace(go.Candlestick(
-                        x=df_price.index, open=open_col, high=high_col,
-                        low=low_col, close=close, name=chart_ticker,
-                    ))
-                else:
-                    fig_price.add_trace(go.Scatter(
-                        x=close.index, y=close.values, mode="lines",
-                        name=chart_ticker, line=dict(color="#2563eb", width=2),
-                        fill="tozeroy", fillcolor="rgba(37,99,235,0.06)",
-                    ))
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                with mc1:
+                    st.metric("Último", f"{last:,.2f}", delta=f"{var_pct:+.2f}% no período")
+                with mc2:
+                    st.metric("Máxima", f"{high:,.2f}")
+                with mc3:
+                    st.metric("Mínima", f"{low:,.2f}")
+                with mc4:
+                    st.metric("Variação", f"{var_pct:+.2f}%")
+
+            fig_price = go.Figure()
+
+            if _ctype == "Candlestick" and "Open" in df_price.columns:
+                open_col = df_price["Open"].iloc[:, 0] if isinstance(df_price["Open"], pd.DataFrame) else df_price["Open"]
+                high_col = df_price["High"].iloc[:, 0] if isinstance(df_price["High"], pd.DataFrame) else df_price["High"]
+                low_col = df_price["Low"].iloc[:, 0] if isinstance(df_price["Low"], pd.DataFrame) else df_price["Low"]
+                fig_price.add_trace(go.Candlestick(
+                    x=df_price.index, open=open_col, high=high_col,
+                    low=low_col, close=close, name=_ticker,
+                ))
+            else:
+                fig_price.add_trace(go.Scatter(
+                    x=close.index, y=close.values, mode="lines",
+                    name=_ticker, line=dict(color="#2563eb", width=2),
+                    fill="tozeroy", fillcolor="rgba(37,99,235,0.06)",
+                ))
+                if len(close) > 0:
                     fig_price.add_annotation(
                         x=close.index[-1], y=close.iloc[-1],
                         text=f"<b>{close.iloc[-1]:,.2f}</b>",
@@ -1840,38 +1881,38 @@ elif page == "🌍 Mercado Hoje":
                         ax=40, ay=-25,
                     )
 
-                fig_price.update_layout(
-                    title=dict(text=f"{chart_ticker} — {period_label}",
-                               font=dict(size=16, color="#111827")),
-                    template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="#ffffff", height=500,
-                    xaxis=dict(gridcolor="#e5e7eb", rangeslider=dict(visible=False)),
-                    yaxis=dict(gridcolor="#e5e7eb"),
-                    hovermode="x unified",
-                )
-                st.plotly_chart(fig_price, use_container_width=True)
+            fig_price.update_layout(
+                title=dict(text=f"{_ticker} — {_period}",
+                           font=dict(size=16, color="#111827")),
+                template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#ffffff", height=500,
+                xaxis=dict(gridcolor="#e5e7eb", rangeslider=dict(visible=False)),
+                yaxis=dict(gridcolor="#e5e7eb"),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_price, use_container_width=True)
 
-                if "Volume" in df_price.columns:
-                    vol = df_price["Volume"]
-                    if isinstance(vol, pd.DataFrame):
-                        vol = vol.iloc[:, 0]
-                    vol = vol.dropna()
-                    if vol.sum() > 0:
-                        fig_vol = go.Figure()
-                        fig_vol.add_trace(go.Bar(
-                            x=vol.index, y=vol.values,
-                            marker_color="rgba(37,99,235,0.3)", name="Volume",
-                        ))
-                        fig_vol.update_layout(
-                            title=dict(text="Volume", font=dict(size=13, color="#6b7280")),
-                            template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="#ffffff", height=200,
-                            margin=dict(l=50, r=50, t=30, b=20),
-                            xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb"),
-                        )
-                        st.plotly_chart(fig_vol, use_container_width=True)
-            else:
-                st.warning(f"Ticker '{chart_ticker}' não encontrado. Verifique o formato (BR: adicione .SA)")
+            if "Volume" in df_price.columns:
+                vol = df_price["Volume"]
+                if isinstance(vol, pd.DataFrame):
+                    vol = vol.iloc[:, 0]
+                vol = vol.dropna()
+                if vol.sum() > 0:
+                    fig_vol = go.Figure()
+                    fig_vol.add_trace(go.Bar(
+                        x=vol.index, y=vol.values,
+                        marker_color="rgba(37,99,235,0.3)", name="Volume",
+                    ))
+                    fig_vol.update_layout(
+                        title=dict(text="Volume", font=dict(size=13, color="#6b7280")),
+                        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="#ffffff", height=200,
+                        margin=dict(l=50, r=50, t=30, b=20),
+                        xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb"),
+                    )
+                    st.plotly_chart(fig_vol, use_container_width=True)
+        elif df_price is None:
+            st.info("Digite um ticker e clique em 'Carregar gráfico'.")
 
     # ─── Tab Fluxo Estrangeiro ───────────────────────────────────────────
 
@@ -1887,8 +1928,12 @@ elif page == "🌍 Mercado Hoje":
             except Exception:
                 return pd.DataFrame()
 
-        df_flows = get_foreign_flows()
-        if not df_flows.empty:
+        if st.button("📊 Carregar Fluxo Estrangeiro", key="load_flows"):
+            with st.spinner("Carregando fluxo cambial..."):
+                st.session_state["data_flows"] = get_foreign_flows()
+
+        df_flows = st.session_state.get("data_flows")
+        if df_flows is not None and not df_flows.empty:
             col_name = df_flows.columns[0]
             serie = df_flows[col_name].dropna()
             serie_cum = serie.cumsum()
@@ -1913,6 +1958,8 @@ elif page == "🌍 Mercado Hoje":
                 yaxis2=dict(gridcolor="#e5e7eb"),
             )
             st.plotly_chart(fig_flow, use_container_width=True)
+        elif df_flows is None:
+            st.info("Clique no botão acima para carregar os dados.")
         else:
             st.caption("⚠️ Fluxo cambial indisponível")
 
@@ -2716,20 +2763,26 @@ elif page == "🏢 CRE Lending":
         "📚 Recursos & Referências",
     ])
 
-    with st.spinner("Carregando dados do FRED..."):
-        result = get_fred_series(FRED_CRE_SERIES, f"{cre_start}-01-01")
-        if isinstance(result, tuple):
-            df_cre, cre_errors = result
-        else:
-            df_cre, cre_errors = result, []
+    if st.button("📊 Carregar dados CRE", key="load_cre"):
+        with st.spinner("Carregando dados do FRED..."):
+            result = get_fred_series(FRED_CRE_SERIES, f"{cre_start}-01-01")
+            if isinstance(result, tuple):
+                st.session_state["data_cre"] = result[0]
+                st.session_state["cre_errors"] = result[1]
+            else:
+                st.session_state["data_cre"] = result
+                st.session_state["cre_errors"] = []
+
+    df_cre = st.session_state.get("data_cre", pd.DataFrame())
+    cre_errors = st.session_state.get("cre_errors", [])
 
     if df_cre.empty:
-        st.error("Não foi possível carregar dados do FRED.")
-        st.caption("Instale pandas-datareader: `pip install pandas-datareader`")
-        if cre_errors:
-            with st.expander("Ver erros"):
-                for e in cre_errors[:10]:
-                    st.text(e)
+        if "data_cre" in st.session_state:
+            st.error("Não foi possível carregar dados do FRED.")
+            if cre_errors:
+                with st.expander("Ver erros"):
+                    for e in cre_errors[:10]:
+                        st.text(e)
     else:
         st.success(f"✅ {len(df_cre.columns)} séries carregadas do FRED")
 
