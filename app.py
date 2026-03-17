@@ -574,7 +574,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navegação",
-        ["🎯 Screener de Ações", "📈 Painel Macro", "🌍 Mercado Hoje", "📋 Análise CVM", "🏢 CRE Lending", "📰 Notícias"],
+        ["🎯 Screener de Ações", "📈 Painel Macro", "📐 Renda Fixa", "🌍 Mercado Hoje", "📋 Análise CVM", "🏢 CRE Lending", "📰 Notícias"],
         label_visibility="collapsed",
     )
 
@@ -786,14 +786,28 @@ elif page == "📈 Painel Macro":
     # ─── Séries macro ────────────────────────────────────────────────────
 
     series_config = {
+        # Juros
         "SELIC Meta (%)": 432,
+        "CDI (%)": 4389,
+        # Inflação
         "IPCA Mensal (%)": 433,
         "IPCA 12m (%)": 13522,
         "IGP-M Mensal (%)": 189,
+        "INPC Mensal (%)": 188,
+        # Câmbio
         "USD/BRL": 1,
+        "EUR/BRL": 21619,
+        # Atividade
         "IBC-Br": 24364,
+        "Produção Industrial (%)": 21859,
+        # Fiscal
         "Dívida/PIB (%)": 13762,
+        "Resultado Primário/PIB (%)": 4505,
+        # Emprego
         "Desemprego (%)": 24369,
+        # Crédito
+        "Crédito/PIB (%)": 20622,
+        "Inadimplência (%)": 20714,
     }
 
     with st.spinner("Carregando dados do Banco Central..."):
@@ -802,21 +816,37 @@ elif page == "📈 Painel Macro":
     if not df_macro.empty:
         # Métricas do último ponto
         st.markdown("### Últimos valores")
-        cols = st.columns(4)
-        priority = ["SELIC Meta (%)", "IPCA 12m (%)", "USD/BRL", "Desemprego (%)"]
-        for i, nome in enumerate(priority):
+        priority_row1 = ["SELIC Meta (%)", "IPCA 12m (%)", "USD/BRL", "Desemprego (%)"]
+        priority_row2 = ["CDI (%)", "IGP-M Mensal (%)", "EUR/BRL", "Dívida/PIB (%)"]
+
+        cols1 = st.columns(4)
+        for i, nome in enumerate(priority_row1):
             if nome in df_macro.columns:
                 serie = df_macro[nome].dropna()
                 if len(serie) > 0:
                     val = serie.iloc[-1]
                     data = serie.index[-1].strftime("%d/%m/%Y")
-                    # Variação vs ponto anterior
                     delta = None
                     if len(serie) > 1:
                         prev = serie.iloc[-2]
                         if prev != 0:
                             delta = f"{((val - prev) / abs(prev)) * 100:+.2f}%"
-                    with cols[i % 4]:
+                    with cols1[i]:
+                        st.metric(nome, f"{val:.2f}", delta=delta, help=f"Último dado: {data}")
+
+        cols2 = st.columns(4)
+        for i, nome in enumerate(priority_row2):
+            if nome in df_macro.columns:
+                serie = df_macro[nome].dropna()
+                if len(serie) > 0:
+                    val = serie.iloc[-1]
+                    data = serie.index[-1].strftime("%d/%m/%Y")
+                    delta = None
+                    if len(serie) > 1:
+                        prev = serie.iloc[-2]
+                        if prev != 0:
+                            delta = f"{((val - prev) / abs(prev)) * 100:+.2f}%"
+                    with cols2[i]:
                         st.metric(nome, f"{val:.2f}", delta=delta, help=f"Último dado: {data}")
 
         st.markdown("---")
@@ -825,12 +855,13 @@ elif page == "📈 Painel Macro":
         st.markdown("### Séries históricas")
 
         chart_groups = {
-            "Juros": ["SELIC Meta (%)"],
-            "Inflação": ["IPCA 12m (%)", "IPCA Mensal (%)", "IGP-M Mensal (%)"],
-            "Câmbio": ["USD/BRL"],
-            "Atividade": ["IBC-Br"],
-            "Fiscal": ["Dívida/PIB (%)"],
+            "Juros": ["SELIC Meta (%)", "CDI (%)"],
+            "Inflação": ["IPCA 12m (%)", "IPCA Mensal (%)", "IGP-M Mensal (%)", "INPC Mensal (%)"],
+            "Câmbio": ["USD/BRL", "EUR/BRL"],
+            "Atividade": ["IBC-Br", "Produção Industrial (%)"],
+            "Fiscal": ["Dívida/PIB (%)", "Resultado Primário/PIB (%)"],
             "Emprego": ["Desemprego (%)"],
+            "Crédito": ["Crédito/PIB (%)", "Inadimplência (%)"],
         }
 
         for group_name, series_names in chart_groups.items():
@@ -902,6 +933,528 @@ elif page == "📈 Painel Macro":
                 st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Não foi possível carregar dados do Focus.")
+
+
+# =============================================================================
+# PAGE: RENDA FIXA (Curva DI + Inflação Implícita)
+# =============================================================================
+
+elif page == "📐 Renda Fixa":
+
+    st.markdown("# 📐 Renda Fixa — Curvas de Juros")
+    st.markdown("ETTJ Prefixada, IPCA e Inflação Implícita — Fonte: ANBIMA / B3")
+    st.caption("⚠️ As taxas podem divergir ~10-15bps da tabela oficial ANBIMA. O pyettj retorna dados em dias corridos (B3), enquanto a ANBIMA publica em dias úteis. A conversão é aproximada. Para valores exatos, consulte anbima.com.br/informacoes/est-termo.")
+
+    # ─── Imports específicos ─────────────────────────────────────────────
+
+    try:
+        from pyettj import ettj as ettj_mod
+        PYETTJ_OK = True
+    except ImportError:
+        PYETTJ_OK = False
+
+    # ─── Data fetchers ───────────────────────────────────────────────────
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def get_ettj_curve(data_str, curva="PRE"):
+        """Busca curva ETTJ da ANBIMA/B3 via pyettj."""
+        if not PYETTJ_OK:
+            return pd.DataFrame()
+        try:
+            df = ettj_mod.get_ettj(data_str, curva=curva)
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def get_di_futures():
+        """Busca cotações ao vivo dos contratos DI1 via API da B3."""
+        try:
+            url = "https://cotacao.b3.com.br/mds/api/v1/DerivativeQuotation/DI1"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, headers=headers, timeout=15)
+            data = r.json()
+            rows = []
+            for item in data.get("Scty", []):
+                ticker = item.get("symb", "")
+                qtn = item.get("SctyQtn", {})
+                asset = item.get("asset", {}).get("AsstSummry", {})
+                buy = item.get("buyOffer", {})
+                sell = item.get("sellOffer", {})
+
+                maturity = asset.get("mtrtyCode", "")
+                adj_price = qtn.get("prvsDayAdjstmntPric", 0)
+                bottom = qtn.get("bottomLmtPric", 0)
+                top = qtn.get("topLmtPric", 0)
+                bid = buy.get("price", 0)
+                ask = sell.get("price", 0)
+                open_int = asset.get("opnCtrcts", 0)
+
+                rows.append({
+                    "Contrato": ticker,
+                    "Vencimento": maturity,
+                    "Ajuste Ant.": adj_price,
+                    "Bid": bid,
+                    "Ask": ask,
+                    "Lim. Inf.": bottom,
+                    "Lim. Sup.": top,
+                    "Contratos Abertos": open_int,
+                })
+
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df = df.sort_values("Vencimento").reset_index(drop=True)
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    @st.cache_data(ttl=7200, show_spinner=False)
+    def get_us_real_yields():
+        """Busca yields reais dos US TIPS via FRED."""
+        try:
+            import pandas_datareader.data as web
+            series = {
+                "US 5Y Real": "DFII5",
+                "US 7Y Real": "DFII7",
+                "US 10Y Real": "DFII10",
+                "US 20Y Real": "DFII20",
+                "US 30Y Real": "DFII30",
+                "US 10Y Nominal": "DGS10",
+                "US 2Y Nominal": "DGS2",
+                "US 5Y Nominal": "DGS5",
+                "US 30Y Nominal": "DGS30",
+            }
+            from datetime import datetime as dt
+            frames = {}
+            for name, code in series.items():
+                try:
+                    d = web.DataReader(code, "fred", dt(2015, 1, 1))
+                    frames[name] = d.iloc[:, 0]
+                except Exception:
+                    pass
+            return pd.DataFrame(frames) if frames else pd.DataFrame()
+        except ImportError:
+            return pd.DataFrame()
+
+    # ─── Helper: formatar data para pyettj ───────────────────────────────
+
+    def fmt_date_ettj(dt_obj):
+        """Converte datetime para formato dd/mm/yyyy."""
+        return dt_obj.strftime("%d/%m/%Y")
+
+    # ─── Calendário ANBIMA para conversão DC → DU ────────────────────────
+
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def get_anbima_calendar():
+        """Cria calendário de dias úteis ANBIMA via bizdays."""
+        try:
+            from bizdays import Calendar
+            try:
+                # Tentar baixar feriados da ANBIMA
+                holidays = pd.read_excel(
+                    "https://www.anbima.com.br/feriados/arqs/feriados_nacionais.xls",
+                    skipfooter=9
+                )["Data"].tolist()
+            except Exception:
+                # Fallback: feriados fixos mais comuns
+                holidays = []
+
+            cal = Calendar(holidays, ["Saturday", "Sunday"], name="ANBIMA")
+            return cal
+        except ImportError:
+            return None
+
+    cal_anbima = get_anbima_calendar()
+
+    def dc_to_du(dias_corridos, ref_date):
+        """Converte dias corridos para dias úteis a partir de uma data de referência."""
+        if cal_anbima is None:
+            # Fallback: aproximação DC * 252/365
+            return int(round(dias_corridos * 252 / 365))
+        try:
+            from datetime import date as dt_date
+            if hasattr(ref_date, 'date'):
+                ref = ref_date.date() if not isinstance(ref_date, dt_date) else ref_date
+            else:
+                ref = ref_date
+            target = ref + timedelta(days=int(dias_corridos))
+            return cal_anbima.bizdays(ref, target)
+        except Exception:
+            return int(round(dias_corridos * 252 / 365))
+
+    def normalize_ettj(df, name="Taxa", ref_date=None):
+        """
+        Normaliza colunas do pyettj para nomes padrão.
+        Converte Dias Corridos → Dias Úteis usando calendário ANBIMA.
+        """
+        if df.empty or len(df.columns) < 2:
+            return pd.DataFrame()
+        result = df[[df.columns[0], df.columns[1]]].copy()
+        result.columns = ["DC", name]
+        result["DC"] = pd.to_numeric(result["DC"], errors="coerce")
+        result[name] = pd.to_numeric(result[name], errors="coerce")
+        result = result.dropna()
+
+        # Converter DC → DU
+        if ref_date is not None:
+            result["DU"] = result["DC"].apply(lambda x: dc_to_du(x, ref_date))
+        else:
+            # Fallback: aproximação
+            result["DU"] = (result["DC"] * 252 / 365).round().astype(int)
+
+        return result
+
+    MAX_YEARS = 12  # Limitar curva a 12 anos (onde é líquida)
+
+    # ─── Sidebar ─────────────────────────────────────────────────────────
+
+    with st.sidebar:
+        st.markdown("### 📅 Datas Curvas")
+        today = datetime.now()
+
+        # Forçar último dia útil ANTERIOR (ANBIMA publica D-1)
+        ref_date = today - timedelta(days=1)
+        while ref_date.weekday() >= 5:  # pular fim de semana
+            ref_date = ref_date - timedelta(days=1)
+
+        dt_atual = st.date_input("Data atual", value=ref_date, key="rf_dt1")
+        dt_comp = st.date_input("Comparar com", value=ref_date - timedelta(days=7), key="rf_dt2")
+        dt_comp2 = st.date_input("Comparar com (2)", value=ref_date - timedelta(days=30), key="rf_dt3")
+        max_anos = st.slider("Prazo máximo (anos)", 2, 30, MAX_YEARS, key="rf_max_anos")
+
+    # ─── Tabs ────────────────────────────────────────────────────────────
+
+    tab_pre, tab_ipca, tab_breakeven, tab_di, tab_us = st.tabs([
+        "📈 Curva PRE",
+        "📊 Curva IPCA",
+        "🔥 Inflação Implícita",
+        "💹 DI Futuro (Live)",
+        "🇺🇸 US Yields",
+    ])
+
+    if not PYETTJ_OK:
+        st.error("Biblioteca `pyettj` não instalada. Rode: `pip install pyettj bizdays html5lib`")
+
+    def plot_curve(curva_tipo, title, dates_list, max_anos_val):
+        """Plota curva ETTJ para múltiplas datas."""
+        fig = go.Figure()
+        colors = ["#2563eb", "#ea580c", "#16a34a"]
+        all_dfs = {}
+
+        for i, (label, dt_val) in enumerate(dates_list):
+            df_raw = get_ettj_curve(fmt_date_ettj(dt_val), curva_tipo)
+            if df_raw.empty:
+                continue
+            df = normalize_ettj(df_raw, "Taxa", ref_date=dt_val)
+            if df.empty:
+                continue
+            df["Anos"] = df["DU"] / 252
+            df = df[df["Anos"] <= max_anos_val]  # LIMITAR
+            all_dfs[label] = df
+
+            fig.add_trace(go.Scatter(
+                x=df["Anos"], y=df["Taxa"],
+                mode="lines+markers",
+                name=f"{label} ({dt_val.strftime('%d/%m')})",
+                line=dict(color=colors[i], width=2.5),
+                marker=dict(size=3),
+                hovertemplate="Prazo: %{x:.1f}a<br>Taxa: %{y:.2f}%<extra></extra>",
+            ))
+
+        if fig.data:
+            fig.update_layout(
+                title=dict(text=title, font=dict(size=16, color="#111827")),
+                template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#ffffff", height=500,
+                xaxis=dict(title="Prazo (anos)", gridcolor="#e5e7eb", range=[0, max_anos_val]),
+                yaxis=dict(title="Taxa (% a.a.)", gridcolor="#e5e7eb"),
+                hovermode="x unified",
+                legend=dict(orientation="h", y=1.12),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        return all_dfs
+
+    # ─── Tab: Curva PRE ──────────────────────────────────────────────────
+
+    with tab_pre:
+        st.markdown("### Curva Prefixada (ETTJ PRE)")
+        st.caption("Fonte: ANBIMA — taxas zero-cupom de títulos prefixados")
+
+        if PYETTJ_OK:
+            dates_to_fetch = [
+                ("Atual", dt_atual),
+                ("Semana anterior", dt_comp),
+                ("Mês anterior", dt_comp2),
+            ]
+            dfs_pre = plot_curve("PRE", "ETTJ Prefixada", dates_to_fetch, max_anos)
+
+            if len(dfs_pre) >= 2:
+                # Tabela de variações
+                st.markdown("#### Variação entre datas")
+                keys = list(dfs_pre.keys())
+                df_a = dfs_pre[keys[0]].set_index("DU")["Taxa"]
+                df_b = dfs_pre[keys[1]].set_index("DU")["Taxa"]
+                common = df_a.index.intersection(df_b.index)
+                if len(common) > 0:
+                    var_df = pd.DataFrame({
+                        "Prazo (anos)": common / 252,
+                        f"{keys[0]} (%)": df_a.loc[common].values,
+                        f"{keys[1]} (%)": df_b.loc[common].values,
+                        "Var (bps)": (df_a.loc[common].values - df_b.loc[common].values) * 100,
+                    })
+                    # Filtrar vértices relevantes
+                    vertices_du = [21, 42, 63, 126, 252, 504, 756, 1260, 1890, 2520]
+                    var_display = var_df[var_df["Prazo (anos)"].apply(
+                        lambda x: any(abs(x - v/252) < 0.05 for v in vertices_du)
+                    )].copy()
+                    if var_display.empty:
+                        var_display = var_df.iloc[::max(1, len(var_df)//15)]
+                    var_display["Prazo (anos)"] = var_display["Prazo (anos)"].apply(lambda x: f"{x:.1f}")
+                    var_display[f"{keys[0]} (%)"] = var_display[f"{keys[0]} (%)"].apply(lambda x: f"{x:.2f}")
+                    var_display[f"{keys[1]} (%)"] = var_display[f"{keys[1]} (%)"].apply(lambda x: f"{x:.2f}")
+                    var_display["Var (bps)"] = var_display["Var (bps)"].apply(lambda x: f"{x:+.0f}")
+                    st.dataframe(var_display, use_container_width=True, hide_index=True)
+
+            if not dfs_pre:
+                st.warning("Não foi possível carregar a curva PRE. Ajuste a data para um dia útil.")
+
+    # ─── Tab: Curva IPCA ─────────────────────────────────────────────────
+
+    with tab_ipca:
+        st.markdown("### Curva Juros Reais (ETTJ IPCA)")
+        st.caption("Fonte: ANBIMA — taxas de NTN-B (juros reais + IPCA)")
+
+        if PYETTJ_OK:
+            dates_to_fetch = [
+                ("Atual", dt_atual),
+                ("Semana anterior", dt_comp),
+                ("Mês anterior", dt_comp2),
+            ]
+            dfs_ipca = plot_curve("DIC", "ETTJ IPCA (Juros Reais)", dates_to_fetch, max_anos)
+            if not dfs_ipca:
+                dfs_ipca = plot_curve("DOC", "ETTJ IPCA (Juros Reais)", dates_to_fetch, max_anos)
+            if not dfs_ipca:
+                st.warning("Curva IPCA não disponível. Tente ajustar a data.")
+
+    # ─── Tab: Inflação Implícita ─────────────────────────────────────────
+
+    with tab_breakeven:
+        st.markdown("### Inflação Implícita (Breakeven)")
+        st.caption("PRE - IPCA = expectativa de inflação embutida na curva")
+
+        if PYETTJ_OK:
+            df_pre_raw = get_ettj_curve(fmt_date_ettj(dt_atual), "PRE")
+            df_ipca_raw = get_ettj_curve(fmt_date_ettj(dt_atual), "DIC")
+            if df_ipca_raw.empty:
+                df_ipca_raw = get_ettj_curve(fmt_date_ettj(dt_atual), "DOC")
+
+            df_pre_n = normalize_ettj(df_pre_raw, "PRE", ref_date=dt_atual)
+            df_ipca_n = normalize_ettj(df_ipca_raw, "IPCA", ref_date=dt_atual)
+
+            if not df_pre_n.empty and not df_ipca_n.empty:
+                # Merge por DU
+                merged = df_pre_n.merge(df_ipca_n, on="DU", how="inner")
+                merged["Anos"] = merged["DU"] / 252
+                merged = merged[merged["Anos"] <= max_anos]
+                merged["Inflação Implícita"] = ((1 + merged["PRE"]/100) / (1 + merged["IPCA"]/100) - 1) * 100
+
+                if len(merged) > 0:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=merged["Anos"], y=merged["PRE"],
+                        mode="lines", name="PRE (Nominal)",
+                        line=dict(color="#2563eb", width=2.5),
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=merged["Anos"], y=merged["IPCA"],
+                        mode="lines", name="IPCA (Real)",
+                        line=dict(color="#16a34a", width=2.5),
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=merged["Anos"], y=merged["Inflação Implícita"],
+                        mode="lines+markers", name="Inflação Implícita",
+                        line=dict(color="#dc2626", width=3, dash="dash"),
+                        marker=dict(size=5),
+                        fill="tozeroy", fillcolor="rgba(220,38,38,0.08)",
+                    ))
+                    fig.update_layout(
+                        title=dict(text=f"Inflação Implícita — {dt_atual.strftime('%d/%m/%Y')}",
+                                   font=dict(size=16, color="#111827")),
+                        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="#ffffff", height=500,
+                        xaxis=dict(title="Prazo (anos)", gridcolor="#e5e7eb", range=[0, max_anos]),
+                        yaxis=dict(title="Taxa (% a.a.)", gridcolor="#e5e7eb"),
+                        hovermode="x unified",
+                        legend=dict(orientation="h", y=1.12),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    # Vértices principais
+                    st.markdown("#### Vértices Principais")
+                    vertices = [1, 2, 3, 5, 7, 10]
+                    vert_data = []
+                    for v in vertices:
+                        if v > max_anos:
+                            continue
+                        closest_idx = (merged["Anos"] - v).abs().idxmin()
+                        row = merged.loc[closest_idx]
+                        vert_data.append({
+                            "Prazo": f"{v}A",
+                            "PRE (%)": f"{row['PRE']:.2f}",
+                            "IPCA (%)": f"{row['IPCA']:.2f}",
+                            "Inflação Impl. (%)": f"{row['Inflação Implícita']:.2f}",
+                        })
+                    if vert_data:
+                        st.dataframe(pd.DataFrame(vert_data), use_container_width=True, hide_index=True)
+                else:
+                    st.warning("Sem vértices em comum entre PRE e IPCA para esta data.")
+            else:
+                st.warning("Não foi possível calcular — faltam dados PRE ou IPCA para a data selecionada.")
+                st.caption("Selecione o último dia útil (ANBIMA não publica no dia atual, fins de semana ou feriados).")
+
+    # ─── Tab: DI Futuro Live ─────────────────────────────────────────────
+
+    with tab_di:
+        st.markdown("### Contratos DI Futuro — Cotações")
+        st.caption("Fonte: API B3 (cotação.b3.com.br)")
+
+        with st.spinner("Carregando DI futures..."):
+            df_di = get_di_futures()
+
+        if not df_di.empty:
+            st.success(f"✅ {len(df_di)} contratos carregados")
+
+            # Chart: curva DI implícita
+            df_plot = df_di[df_di["Ajuste Ant."] > 0].copy()
+            if not df_plot.empty and "Vencimento" in df_plot.columns:
+                df_plot["Venc_dt"] = pd.to_datetime(df_plot["Vencimento"], errors="coerce")
+                df_plot = df_plot.dropna(subset=["Venc_dt"]).sort_values("Venc_dt")
+                df_plot["Anos"] = (df_plot["Venc_dt"] - pd.Timestamp.now()).dt.days / 365
+
+                fig_di = go.Figure()
+                fig_di.add_trace(go.Scatter(
+                    x=df_plot["Anos"], y=df_plot["Ajuste Ant."],
+                    mode="lines+markers", name="Ajuste Anterior",
+                    line=dict(color="#2563eb", width=2.5), marker=dict(size=5),
+                    hovertemplate="%{text}<br>Taxa: %{y:.3f}%<br>Prazo: %{x:.1f}a<extra></extra>",
+                    text=df_plot["Contrato"],
+                ))
+                if "Bid" in df_plot.columns:
+                    fig_di.add_trace(go.Scatter(
+                        x=df_plot["Anos"], y=df_plot["Bid"],
+                        mode="lines", name="Bid",
+                        line=dict(color="#16a34a", width=1, dash="dot"), opacity=0.7,
+                    ))
+                    fig_di.add_trace(go.Scatter(
+                        x=df_plot["Anos"], y=df_plot["Ask"],
+                        mode="lines", name="Ask",
+                        line=dict(color="#dc2626", width=1, dash="dot"), opacity=0.7,
+                    ))
+                fig_di.update_layout(
+                    title=dict(text="Curva DI Futuro (B3 Live)", font=dict(size=16, color="#111827")),
+                    template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="#ffffff", height=450,
+                    xaxis=dict(title="Prazo (anos)", gridcolor="#e5e7eb"),
+                    yaxis=dict(title="Taxa (% a.a.)", gridcolor="#e5e7eb"),
+                    hovermode="x unified", legend=dict(orientation="h", y=1.12),
+                )
+                st.plotly_chart(fig_di, use_container_width=True)
+
+            # Tabela
+            st.dataframe(df_di, use_container_width=True, hide_index=True, height=500)
+        else:
+            st.warning("API da B3 indisponível. Pode estar fora do horário de pregão.")
+            st.caption("A API retorna dados durante o horário de negociação (10h-18h).")
+
+    # ─── Tab: US Yields ──────────────────────────────────────────────────
+
+    with tab_us:
+        st.markdown("### Curva de Juros EUA")
+        st.caption("Treasury Yields (nominais e reais/TIPS) — Fonte: FRED")
+
+        with st.spinner("Carregando US yields..."):
+            df_us = get_us_real_yields()
+
+        if not df_us.empty:
+            # Último ponto
+            st.markdown("#### Últimos valores")
+            cols_m = st.columns(4)
+            priority = ["US 10Y Nominal", "US 2Y Nominal", "US 10Y Real", "US 5Y Real"]
+            for i, k in enumerate(priority):
+                if k in df_us.columns:
+                    s = df_us[k].dropna()
+                    if len(s) > 0:
+                        with cols_m[i]:
+                            st.metric(k, f"{s.iloc[-1]:.2f}%")
+
+            # Gráfico nominal
+            fig_nom = go.Figure()
+            nom_cols = [c for c in df_us.columns if "Nominal" in c]
+            colors_n = ["#2563eb", "#60a5fa", "#93c5fd", "#bfdbfe"]
+            for i, c in enumerate(nom_cols):
+                s = df_us[c].dropna()
+                fig_nom.add_trace(go.Scatter(
+                    x=s.index, y=s.values, mode="lines",
+                    name=c, line=dict(color=colors_n[i % len(colors_n)], width=2),
+                ))
+            fig_nom.update_layout(
+                title=dict(text="US Treasury Yields (Nominal)", font=dict(size=15, color="#111827")),
+                template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#ffffff", height=400,
+                xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="%"),
+                hovermode="x unified", legend=dict(orientation="h", y=1.12),
+            )
+            st.plotly_chart(fig_nom, use_container_width=True)
+
+            # Gráfico real
+            fig_real = go.Figure()
+            real_cols = [c for c in df_us.columns if "Real" in c]
+            colors_r = ["#dc2626", "#f97316", "#eab308", "#84cc16", "#22c55e"]
+            for i, c in enumerate(real_cols):
+                s = df_us[c].dropna()
+                fig_real.add_trace(go.Scatter(
+                    x=s.index, y=s.values, mode="lines",
+                    name=c, line=dict(color=colors_r[i % len(colors_r)], width=2),
+                ))
+            fig_real.add_hline(y=0, line_dash="dash", line_color="#6b7280", opacity=0.5)
+            fig_real.update_layout(
+                title=dict(text="US TIPS Yields (Real)", font=dict(size=15, color="#111827")),
+                template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#ffffff", height=400,
+                xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="%"),
+                hovermode="x unified", legend=dict(orientation="h", y=1.12),
+            )
+            st.plotly_chart(fig_real, use_container_width=True)
+
+            # US Breakeven
+            if "US 10Y Nominal" in df_us.columns and "US 10Y Real" in df_us.columns:
+                be = (df_us["US 10Y Nominal"] - df_us["US 10Y Real"]).dropna()
+                fig_be = go.Figure()
+                fig_be.add_trace(go.Scatter(
+                    x=be.index, y=be.values, mode="lines",
+                    name="US 10Y Breakeven",
+                    line=dict(color="#dc2626", width=2.5),
+                    fill="tozeroy", fillcolor="rgba(220,38,38,0.08)",
+                ))
+                last_be = be.iloc[-1]
+                fig_be.add_annotation(
+                    x=be.index[-1], y=last_be,
+                    text=f"<b>{last_be:.2f}%</b>", showarrow=True,
+                    arrowcolor="#dc2626", font=dict(color="#fff", size=12),
+                    bgcolor="#dc2626", ax=40, ay=-25,
+                )
+                fig_be.update_layout(
+                    title=dict(text="US 10Y Breakeven Inflation", font=dict(size=15, color="#111827")),
+                    template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="#ffffff", height=350,
+                    xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="%"),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_be, use_container_width=True)
+        else:
+            st.warning("Não foi possível carregar dados do FRED.")
+            st.caption("Instale: `pip install pandas-datareader`")
 
 
 # =============================================================================
@@ -1126,16 +1679,242 @@ elif page == "🌍 Mercado Hoje":
 
     # ─── Render tabs ─────────────────────────────────────────────────────
 
-    tabs = st.tabs(list(WATCHLISTS.keys()))
+    tab_names = list(WATCHLISTS.keys()) + ["📊 IBOV Composição", "🔍 Gráfico de Preço", "💸 Fluxo Estrangeiro"]
+    tabs = st.tabs(tab_names)
 
-    for tab, (wl_name, tickers) in zip(tabs, WATCHLISTS.items()):
+    # ─── Watchlist tabs ──────────────────────────────────────────────────
+
+    for tab, (wl_name, tickers) in zip(tabs[:len(WATCHLISTS)], WATCHLISTS.items()):
         with tab:
-            # Add custom ticker if entered
             active_tickers = dict(tickers)
             if custom_ticker:
                 active_tickers[custom_ticker.upper()] = custom_ticker
-
             show_watchlist(wl_name, active_tickers)
+
+    # ─── Tab IBOV Composição ─────────────────────────────────────────────
+
+    with tabs[len(WATCHLISTS)]:
+        IBOV_SETORES = {
+            "Financeiro": ["ITUB4", "BBDC4", "BBAS3", "SANB11", "BPAC11", "B3SA3", "BBSE3"],
+            "Petróleo & Gás": ["PETR4", "PETR3", "PRIO3", "BRAV3", "CSAN3", "UGPA3", "VBBR3"],
+            "Mineração & Siderurgia": ["VALE3", "CSNA3", "GGBR4", "GOAU4", "CMIN3"],
+            "Utilities": ["ELET3", "ELET6", "EQTL3", "ENGI11", "CPFE3", "CMIG4", "CPLE6", "SBSP3", "ENEV3"],
+            "Consumo & Varejo": ["ABEV3", "LREN3", "MGLU3", "PETZ3", "ARZZ3", "SOMA3", "NTCO3", "ASAI3"],
+            "Saúde": ["RDOR3", "HAPV3", "RADL3", "FLRY3"],
+            "Indústria": ["WEGE3", "EMBR3", "SUZB3", "KLBN11"],
+            "Telecom & Tech": ["VIVT3", "TOTS3", "CASH3"],
+            "Imobiliário": ["MULT3", "CYRE3", "MRVE3", "EZTC3"],
+            "Alimentos & Agro": ["JBSS3", "BRFS3", "BEEF3", "SMTO3", "SLCE3"],
+        }
+
+        @st.cache_data(ttl=7200, show_spinner=False)
+        def get_ibov_sector_weights():
+            all_tickers = []
+            ticker_sector = {}
+            for setor, tickers in IBOV_SETORES.items():
+                for t in tickers:
+                    all_tickers.append(t + ".SA")
+                    ticker_sector[t + ".SA"] = setor
+            try:
+                data = yf.download(all_tickers, period="1d", progress=False, auto_adjust=True)
+                if data.empty:
+                    return pd.DataFrame()
+            except Exception:
+                return pd.DataFrame()
+            sector_cap = {}
+            for t in all_tickers:
+                try:
+                    info = yf.Ticker(t).fast_info
+                    mcap = getattr(info, "market_cap", 0) or 0
+                    setor = ticker_sector.get(t, "Outros")
+                    sector_cap[setor] = sector_cap.get(setor, 0) + mcap
+                except Exception:
+                    pass
+            if sector_cap:
+                total = sum(sector_cap.values())
+                df = pd.DataFrame([
+                    {"Setor": k, "Market Cap (R$ bi)": v / 1e9, "Peso (%)": (v / total) * 100}
+                    for k, v in sorted(sector_cap.items(), key=lambda x: -x[1])
+                ])
+                return df
+            return pd.DataFrame()
+
+        with st.spinner("Calculando composição setorial..."):
+            df_ibov = get_ibov_sector_weights()
+
+        if not df_ibov.empty:
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=df_ibov["Setor"], values=df_ibov["Peso (%)"],
+                    hole=0.4, textinfo="label+percent",
+                    marker=dict(colors=["#2563eb", "#ea580c", "#16a34a", "#9333ea",
+                                        "#dc2626", "#eab308", "#06b6d4", "#ec4899",
+                                        "#84cc16", "#f97316"]),
+                )])
+                fig_pie.update_layout(
+                    title=dict(text="IBOV — Concentração por Setor", font=dict(size=15, color="#111827")),
+                    template="plotly_white", paper_bgcolor="rgba(0,0,0,0)", height=450,
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            with c2:
+                st.dataframe(df_ibov, use_container_width=True, hide_index=True)
+        else:
+            st.caption("⚠️ Não foi possível calcular composição setorial")
+
+    # ─── Tab Gráfico de Preço ────────────────────────────────────────────
+
+    with tabs[len(WATCHLISTS) + 1]:
+        st.markdown("### Gráfico de Preço Individual")
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            chart_ticker = st.text_input(
+                "Ticker (ex: PETR4.SA, AAPL, BTC-USD, USDBRL=X)",
+                value="PETR4.SA", key="price_chart_ticker",
+            )
+        with c2:
+            period_map = {"1M": "1mo", "3M": "3mo", "6M": "6mo", "1A": "1y", "2A": "2y", "5A": "5y", "10A": "10y", "Máx": "max"}
+            period_label = st.selectbox("Período", list(period_map.keys()), index=3, key="price_period")
+        with c3:
+            chart_type = st.selectbox("Tipo", ["Linha", "Candlestick"], key="price_chart_type")
+
+        if chart_ticker:
+            @st.cache_data(ttl=3600, show_spinner=False)
+            def get_price_data(ticker, period):
+                try:
+                    import yfinance as yf
+                    data = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+                    return data
+                except Exception:
+                    return pd.DataFrame()
+
+            with st.spinner(f"Carregando {chart_ticker}..."):
+                df_price = get_price_data(chart_ticker, period_map[period_label])
+
+            if not df_price.empty:
+                close = df_price["Close"]
+                if isinstance(close, pd.DataFrame):
+                    close = close.iloc[:, 0]
+                close = close.dropna()
+
+                if len(close) > 1:
+                    last = close.iloc[-1]
+                    first = close.iloc[0]
+                    var_pct = ((last - first) / first) * 100
+                    high = close.max()
+                    low = close.min()
+
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    with mc1:
+                        st.metric("Último", f"{last:,.2f}", delta=f"{var_pct:+.2f}% no período")
+                    with mc2:
+                        st.metric("Máxima", f"{high:,.2f}")
+                    with mc3:
+                        st.metric("Mínima", f"{low:,.2f}")
+                    with mc4:
+                        st.metric("Variação", f"{var_pct:+.2f}%")
+
+                fig_price = go.Figure()
+
+                if chart_type == "Candlestick" and "Open" in df_price.columns:
+                    open_col = df_price["Open"].iloc[:, 0] if isinstance(df_price["Open"], pd.DataFrame) else df_price["Open"]
+                    high_col = df_price["High"].iloc[:, 0] if isinstance(df_price["High"], pd.DataFrame) else df_price["High"]
+                    low_col = df_price["Low"].iloc[:, 0] if isinstance(df_price["Low"], pd.DataFrame) else df_price["Low"]
+                    fig_price.add_trace(go.Candlestick(
+                        x=df_price.index, open=open_col, high=high_col,
+                        low=low_col, close=close, name=chart_ticker,
+                    ))
+                else:
+                    fig_price.add_trace(go.Scatter(
+                        x=close.index, y=close.values, mode="lines",
+                        name=chart_ticker, line=dict(color="#2563eb", width=2),
+                        fill="tozeroy", fillcolor="rgba(37,99,235,0.06)",
+                    ))
+                    fig_price.add_annotation(
+                        x=close.index[-1], y=close.iloc[-1],
+                        text=f"<b>{close.iloc[-1]:,.2f}</b>",
+                        showarrow=True, arrowhead=2, arrowcolor="#2563eb",
+                        font=dict(size=12, color="#fff"), bgcolor="#2563eb",
+                        ax=40, ay=-25,
+                    )
+
+                fig_price.update_layout(
+                    title=dict(text=f"{chart_ticker} — {period_label}",
+                               font=dict(size=16, color="#111827")),
+                    template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="#ffffff", height=500,
+                    xaxis=dict(gridcolor="#e5e7eb", rangeslider=dict(visible=False)),
+                    yaxis=dict(gridcolor="#e5e7eb"),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_price, use_container_width=True)
+
+                if "Volume" in df_price.columns:
+                    vol = df_price["Volume"]
+                    if isinstance(vol, pd.DataFrame):
+                        vol = vol.iloc[:, 0]
+                    vol = vol.dropna()
+                    if vol.sum() > 0:
+                        fig_vol = go.Figure()
+                        fig_vol.add_trace(go.Bar(
+                            x=vol.index, y=vol.values,
+                            marker_color="rgba(37,99,235,0.3)", name="Volume",
+                        ))
+                        fig_vol.update_layout(
+                            title=dict(text="Volume", font=dict(size=13, color="#6b7280")),
+                            template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="#ffffff", height=200,
+                            margin=dict(l=50, r=50, t=30, b=20),
+                            xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb"),
+                        )
+                        st.plotly_chart(fig_vol, use_container_width=True)
+            else:
+                st.warning(f"Ticker '{chart_ticker}' não encontrado. Verifique o formato (BR: adicione .SA)")
+
+    # ─── Tab Fluxo Estrangeiro ───────────────────────────────────────────
+
+    with tabs[len(WATCHLISTS) + 2]:
+        st.markdown("### Fluxo de Capital Estrangeiro B3")
+
+        @st.cache_data(ttl=7200, show_spinner=False)
+        def get_foreign_flows():
+            try:
+                from bcb import sgs
+                df = sgs.get({"Fluxo Cambial Financeiro (US$ mi)": 22023}, start="2020-01-01")
+                return df
+            except Exception:
+                return pd.DataFrame()
+
+        df_flows = get_foreign_flows()
+        if not df_flows.empty:
+            col_name = df_flows.columns[0]
+            serie = df_flows[col_name].dropna()
+            serie_cum = serie.cumsum()
+
+            fig_flow = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                                      subplot_titles=["Fluxo Diário (US$ mi)", "Acumulado (US$ mi)"])
+            fig_flow.add_trace(go.Bar(
+                x=serie.index, y=serie.values,
+                marker_color=["#16a34a" if v >= 0 else "#dc2626" for v in serie.values],
+                name="Diário", showlegend=False,
+            ), row=1, col=1)
+            fig_flow.add_trace(go.Scatter(
+                x=serie_cum.index, y=serie_cum.values,
+                mode="lines", line=dict(color="#2563eb", width=2),
+                name="Acumulado", showlegend=False,
+            ), row=2, col=1)
+            fig_flow.add_hline(y=0, line_dash="dash", line_color="#6b7280", opacity=0.5, row=2, col=1)
+            fig_flow.update_layout(
+                template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#ffffff", height=600,
+                xaxis2=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb"),
+                yaxis2=dict(gridcolor="#e5e7eb"),
+            )
+            st.plotly_chart(fig_flow, use_container_width=True)
+        else:
+            st.caption("⚠️ Fluxo cambial indisponível")
 
     # Download all
     st.markdown("---")
@@ -1424,15 +2203,152 @@ elif page == "📋 Análise CVM":
                     )
                 st.dataframe(display_serie, use_container_width=True)
 
-                # Gráficos
-                chart_metrics = ["Receita Líquida (R$ mi)", "EBIT (R$ mi)", "Lucro Líquido (R$ mi)",
-                                 "Margem EBIT (%)", "ROE (%)", "ROIC (%)", "Dívida Líquida (R$ mi)", "FCO (R$ mi)"]
+                # Helper: add Y-axis padding to charts
+                def add_y_padding(fig):
+                    """Adds 15% padding above max value to prevent text cutoff."""
+                    all_y = []
+                    for trace in fig.data:
+                        if hasattr(trace, 'y') and trace.y is not None:
+                            all_y.extend([v for v in trace.y if v is not None])
+                    if all_y:
+                        y_min = min(all_y)
+                        y_max = max(all_y)
+                        rng = y_max - y_min if y_max != y_min else abs(y_max) * 0.2
+                        pad = rng * 0.2
+                        fig.update_yaxes(range=[y_min - pad * 0.3, y_max + pad])
 
-                available_metrics = [m for m in chart_metrics if m in serie_df.index]
-                selected_charts = st.multiselect("Métricas para gráficos", available_metrics,
-                                                  default=available_metrics[:4], key="cvm_chart_sel")
+                # ─── Gráficos de LINHA: Margens ─────────────────────────────
+                st.markdown("#### Evolução de Margens")
+                margin_metrics = ["Margem Bruta (%)", "Margem EBIT (%)", "Margem Líquida (%)"]
+                avail_margins = [m for m in margin_metrics if m in serie_df.index]
 
-                for metric in selected_charts:
+                if avail_margins:
+                    fig_margins = go.Figure()
+                    m_colors = ["#2563eb", "#ea580c", "#16a34a"]
+                    for i, metric in enumerate(avail_margins):
+                        row = serie_df.loc[metric].dropna()
+                        if len(row) > 0:
+                            fig_margins.add_trace(go.Scatter(
+                                x=[str(y) for y in row.index], y=row.values,
+                                mode="lines+markers+text", name=metric.replace(" (%)", ""),
+                                line=dict(color=m_colors[i], width=2.5),
+                                marker=dict(size=8),
+                                text=[f"{v:.1f}%" for v in row.values],
+                                textposition="top center", textfont=dict(size=10),
+                            ))
+                    add_y_padding(fig_margins)
+                    fig_margins.update_layout(
+                        title=dict(text="Margens (%)", font=dict(size=15, color="#111827")),
+                        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="#ffffff", height=420,
+                        xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="%"),
+                        hovermode="x unified", legend=dict(orientation="h", y=1.15),
+                    )
+                    st.plotly_chart(fig_margins, use_container_width=True)
+                    st.caption("Margem Bruta = (Receita − CPV) / Receita  •  "
+                               "Margem EBIT = EBIT / Receita  •  "
+                               "Margem Líquida = Lucro Líquido / Receita")
+
+                # ─── Gráficos de LINHA: Retornos ────────────────────────────
+                st.markdown("#### Evolução de Retornos")
+                return_metrics = ["ROE (%)", "ROIC (%)", "ROA (%)"]
+                avail_returns = [m for m in return_metrics if m in serie_df.index]
+
+                if avail_returns:
+                    fig_returns = go.Figure()
+                    r_colors = ["#9333ea", "#dc2626", "#eab308"]
+                    for i, metric in enumerate(avail_returns):
+                        row = serie_df.loc[metric].dropna()
+                        if len(row) > 0:
+                            fig_returns.add_trace(go.Scatter(
+                                x=[str(y) for y in row.index], y=row.values,
+                                mode="lines+markers+text", name=metric.replace(" (%)", ""),
+                                line=dict(color=r_colors[i], width=2.5),
+                                marker=dict(size=8),
+                                text=[f"{v:.1f}%" for v in row.values],
+                                textposition="top center", textfont=dict(size=10),
+                            ))
+                    add_y_padding(fig_returns)
+                    fig_returns.update_layout(
+                        title=dict(text="Retornos (%)", font=dict(size=15, color="#111827")),
+                        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="#ffffff", height=420,
+                        xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="%"),
+                        hovermode="x unified", legend=dict(orientation="h", y=1.15),
+                    )
+                    st.plotly_chart(fig_returns, use_container_width=True)
+                    st.caption("ROE = Lucro Líquido / Patrimônio Líquido  •  "
+                               "ROIC = EBIT / (PL + Dívida Bruta)  •  "
+                               "ROA = Lucro Líquido / Ativo Total")
+
+                # ─── Gráfico de LINHA: Endividamento ────────────────────────
+                st.markdown("#### Evolução do Endividamento")
+                debt_metrics = ["Dívida Bruta (R$ mi)", "Dívida Líquida (R$ mi)",
+                                "Caixa + Aplic. (R$ mi)", "Dívida Bruta / PL"]
+                avail_debt = [m for m in debt_metrics if m in serie_df.index]
+
+                if avail_debt:
+                    abs_debt = [m for m in avail_debt if "R$ mi" in m]
+                    ratio_debt = [m for m in avail_debt if "R$ mi" not in m]
+
+                    if abs_debt:
+                        fig_debt = go.Figure()
+                        debt_colors = ["#dc2626", "#ea580c", "#16a34a"]
+                        for i, metric in enumerate(abs_debt):
+                            row = serie_df.loc[metric].dropna()
+                            if len(row) > 0:
+                                fig_debt.add_trace(go.Scatter(
+                                    x=[str(y) for y in row.index], y=row.values,
+                                    mode="lines+markers+text", name=metric.replace(" (R$ mi)", ""),
+                                    line=dict(color=debt_colors[i % len(debt_colors)], width=2.5),
+                                    marker=dict(size=8),
+                                    text=[f"{v:,.0f}" for v in row.values],
+                                    textposition="top center", textfont=dict(size=9),
+                                ))
+                        fig_debt.add_hline(y=0, line_dash="dash", line_color="#6b7280", opacity=0.5)
+                        add_y_padding(fig_debt)
+                        fig_debt.update_layout(
+                            title=dict(text="Endividamento (R$ mi)", font=dict(size=15, color="#111827")),
+                            template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="#ffffff", height=450,
+                            xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="R$ milhões"),
+                            hovermode="x unified", legend=dict(orientation="h", y=1.15),
+                        )
+                        st.plotly_chart(fig_debt, use_container_width=True)
+                        st.caption("Dívida Bruta = Empréstimos CP + LP  •  "
+                                   "Dívida Líquida = Dívida Bruta − Caixa − Aplicações Financeiras")
+
+                    if ratio_debt:
+                        fig_ratio = go.Figure()
+                        for metric in ratio_debt:
+                            row = serie_df.loc[metric].dropna()
+                            if len(row) > 0:
+                                fig_ratio.add_trace(go.Bar(
+                                    x=[str(y) for y in row.index], y=row.values,
+                                    name=metric, marker_color="#ea580c",
+                                    text=[f"{v:.2f}x" for v in row.values], textposition="outside",
+                                ))
+                        add_y_padding(fig_ratio)
+                        fig_ratio.update_layout(
+                            title=dict(text="Alavancagem — Dívida Bruta / Patrimônio Líquido",
+                                       font=dict(size=15, color="#111827")),
+                            template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="#ffffff", height=380,
+                            xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb", title="x"),
+                        )
+                        st.plotly_chart(fig_ratio, use_container_width=True)
+                        st.caption("Alavancagem = Dívida Bruta (Empréstimos CP + LP) / Patrimônio Líquido.  "
+                                   "Valores > 1.0x indicam que a empresa deve mais do que seu patrimônio próprio.")
+
+                # Gráficos de BARRA para valores absolutos (receita, EBIT, lucro, FCO)
+                st.markdown("#### Receita, Lucro e Caixa")
+                bar_metrics = ["Receita Líquida (R$ mi)", "EBIT (R$ mi)",
+                               "Lucro Líquido (R$ mi)", "FCO (R$ mi)"]
+                avail_bar = [m for m in bar_metrics if m in serie_df.index]
+                sel_bar = st.multiselect("Métricas (barras)", avail_bar,
+                                         default=avail_bar[:3], key="cvm_bar_sel")
+
+                for metric in sel_bar:
                     row = serie_df.loc[metric].dropna()
                     if len(row) == 0:
                         continue
@@ -1440,14 +2356,14 @@ elif page == "📋 Análise CVM":
                     colors = ["#16a34a" if v >= 0 else "#dc2626" for v in row.values]
                     fig.add_trace(go.Bar(
                         x=[str(y) for y in row.index], y=row.values,
-                        marker_color=colors, text=[f"{v:,.0f}" if abs(v) > 1 else f"{v:.1f}" for v in row.values],
+                        marker_color=colors, text=[f"{v:,.0f}" for v in row.values],
                         textposition="outside",
                     ))
+                    add_y_padding(fig)
                     fig.update_layout(
                         title=dict(text=metric, font=dict(size=15, color="#111827")),
                         template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
                         plot_bgcolor="#ffffff", height=350,
-                        margin=dict(l=50, r=50, t=50, b=40),
                         xaxis=dict(gridcolor="#e5e7eb"), yaxis=dict(gridcolor="#e5e7eb"),
                     )
                     st.plotly_chart(fig, use_container_width=True)
@@ -1467,62 +2383,165 @@ elif page == "📋 Análise CVM":
             value="PETROBRAS, VALE, WEG",
             key="cvm_comp_input",
         )
-        ano_comp = st.selectbox("Ano para comparação", anos_disp, key="cvm_comp_ano")
+        nomes = [e.strip() for e in empresas_comp.split(",") if e.strip()]
 
-        if st.button("Comparar", key="cvm_comp_btn"):
-            nomes = [e.strip() for e in empresas_comp.split(",") if e.strip()]
+        sub_tab_snap, sub_tab_evo = st.tabs(["📊 Snapshot (1 ano)", "📈 Evolução Multi-Ano"])
 
-            comp_data = {}
-            progress = st.progress(0)
-            for i, nome in enumerate(nomes):
-                try:
-                    ind = cvm_indicadores(nome, ano_comp, doc_type)
-                    if not ind.empty:
-                        comp_data[nome] = cvm_metricas(ind)
-                except Exception:
-                    st.caption(f"⚠️ {nome}: não encontrado")
-                progress.progress((i + 1) / len(nomes))
-            progress.empty()
+        with sub_tab_snap:
+            ano_comp = st.selectbox("Ano", anos_disp, key="cvm_comp_ano")
 
-            if comp_data:
-                comp_df = pd.DataFrame(comp_data)
-                comp_df.index.name = "Métrica"
+            if st.button("Comparar", key="cvm_comp_btn"):
+                comp_data = {}
+                progress = st.progress(0)
+                for i, nome in enumerate(nomes):
+                    try:
+                        ind = cvm_indicadores(nome, ano_comp, doc_type)
+                        if not ind.empty:
+                            comp_data[nome] = cvm_metricas(ind)
+                    except Exception:
+                        st.caption(f"⚠️ {nome}: não encontrado")
+                    progress.progress((i + 1) / len(nomes))
+                progress.empty()
 
-                # Formatar
-                display_comp = comp_df.copy()
-                for col in display_comp.columns:
-                    display_comp[col] = display_comp[col].apply(
-                        lambda x: f"{x:,.1f}" if pd.notna(x) else "—"
-                    )
-                st.dataframe(display_comp, use_container_width=True)
+                if comp_data:
+                    comp_df = pd.DataFrame(comp_data)
+                    comp_df.index.name = "Métrica"
 
-                # Gráfico comparativo
-                comp_metrics = ["Margem EBIT (%)", "ROE (%)", "ROIC (%)", "Dívida Bruta / PL"]
-                available = [m for m in comp_metrics if m in comp_df.index]
+                    display_comp = comp_df.copy()
+                    for col in display_comp.columns:
+                        display_comp[col] = display_comp[col].apply(
+                            lambda x: f"{x:,.1f}" if pd.notna(x) else "—"
+                        )
+                    st.dataframe(display_comp, use_container_width=True)
 
-                if available:
-                    metric_sel = st.selectbox("Métrica para gráfico", available, key="cvm_comp_metric")
-                    row = comp_df.loc[metric_sel].dropna()
-                    fig = go.Figure()
-                    fig.add_trace(go.Bar(
-                        x=list(row.index), y=list(row.values),
-                        marker_color=["#2563eb", "#ea580c", "#16a34a", "#9333ea", "#dc2626"][:len(row)],
-                        text=[f"{v:.1f}" for v in row.values], textposition="outside",
+                    comp_metrics = ["Margem Bruta (%)", "Margem EBIT (%)", "Margem Líquida (%)",
+                                    "ROE (%)", "ROIC (%)", "Dívida Bruta / PL", "Liquidez Corrente"]
+                    available = [m for m in comp_metrics if m in comp_df.index]
+
+                    if available:
+                        metric_sel = st.selectbox("Métrica para gráfico", available, key="cvm_comp_metric")
+                        row = comp_df.loc[metric_sel].dropna()
+                        fig = go.Figure()
+                        bar_colors = ["#2563eb", "#ea580c", "#16a34a", "#9333ea", "#dc2626"]
+                        fig.add_trace(go.Bar(
+                            x=list(row.index), y=list(row.values),
+                            marker_color=bar_colors[:len(row)],
+                            text=[f"{v:.1f}" for v in row.values], textposition="outside",
+                        ))
+                        # Linha de média
+                        avg = row.mean()
+                        fig.add_hline(y=avg, line_dash="dash", line_color="#6b7280",
+                                      annotation_text=f"Média: {avg:.1f}", annotation_position="top left")
+                        fig.update_layout(
+                            title=dict(text=f"{metric_sel} — {ano_comp}", font=dict(size=15, color="#111827")),
+                            template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="#ffffff", height=400,
+                            yaxis=dict(gridcolor="#e5e7eb"),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    csv = comp_df.to_csv(sep=";")
+                    st.download_button("📥 Baixar comparação", csv,
+                                        f"cvm_comparacao_{ano_comp}.csv", "text/csv", key="dl_cvm_comp")
+                else:
+                    st.warning("Nenhuma empresa encontrada.")
+
+        with sub_tab_evo:
+            st.markdown("#### Evolução comparativa ao longo dos anos")
+            st.caption("Compara ROE, ROIC, margens de múltiplas empresas ao longo do tempo")
+
+            anos_evo = st.multiselect("Anos", anos_disp, default=anos_disp[:5], key="cvm_evo_anos")
+            metric_evo = st.selectbox("Métrica", [
+                "ROE (%)", "ROIC (%)", "Margem EBIT (%)", "Margem Líquida (%)",
+                "Margem Bruta (%)", "Dívida Bruta / PL", "Receita Líquida (R$ mi)",
+                "Lucro Líquido (R$ mi)", "Dívida Líquida (R$ mi)", "FCO (R$ mi)",
+            ], key="cvm_evo_metric")
+
+            if st.button("Gerar evolução", key="cvm_evo_btn") and nomes and anos_evo:
+                evo_data = {}  # {empresa: {ano: valor}}
+                progress = st.progress(0)
+                total = len(nomes) * len(anos_evo)
+                count = 0
+
+                for nome in nomes:
+                    evo_data[nome] = {}
+                    for ano in sorted(anos_evo):
+                        try:
+                            ind = cvm_indicadores(nome, ano, doc_type)
+                            if not ind.empty:
+                                met = cvm_metricas(ind)
+                                if metric_evo in met:
+                                    evo_data[nome][ano] = met[metric_evo]
+                        except Exception:
+                            pass
+                        count += 1
+                        progress.progress(count / total)
+                progress.empty()
+
+                # Plotar
+                fig_evo = go.Figure()
+                evo_colors = ["#2563eb", "#ea580c", "#16a34a", "#9333ea", "#dc2626",
+                              "#eab308", "#06b6d4", "#ec4899"]
+
+                has_data = False
+                all_values = []
+                for i, (nome, values) in enumerate(evo_data.items()):
+                    if not values:
+                        continue
+                    has_data = True
+                    anos_sorted = sorted(values.keys())
+                    vals = [values[a] for a in anos_sorted]
+                    all_values.extend(vals)
+                    fig_evo.add_trace(go.Scatter(
+                        x=[str(a) for a in anos_sorted], y=vals,
+                        mode="lines+markers+text", name=nome,
+                        line=dict(color=evo_colors[i % len(evo_colors)], width=2.5),
+                        marker=dict(size=8),
+                        text=[f"{v:.1f}" if "%" in metric_evo or "/" in metric_evo
+                              else f"{v:,.0f}" for v in vals],
+                        textposition="top center", textfont=dict(size=9),
                     ))
-                    fig.update_layout(
-                        title=dict(text=f"{metric_sel} — {ano_comp}", font=dict(size=15, color="#111827")),
-                        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
-                        plot_bgcolor="#ffffff", height=400,
-                        margin=dict(l=50, r=50, t=50, b=40),
-                        yaxis=dict(gridcolor="#e5e7eb"),
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
 
-                csv = comp_df.to_csv(sep=";")
-                st.download_button("📥 Baixar comparação", csv,
-                                    f"cvm_comparacao_{ano_comp}.csv", "text/csv", key="dl_cvm_comp")
-            else:
-                st.warning("Nenhuma empresa encontrada.")
+                if has_data:
+                    # Média das empresas selecionadas
+                    avg_by_year = {}
+                    for nome, values in evo_data.items():
+                        for ano, val in values.items():
+                            avg_by_year.setdefault(ano, []).append(val)
+                    avg_anos = sorted(avg_by_year.keys())
+                    avg_vals = [sum(avg_by_year[a]) / len(avg_by_year[a]) for a in avg_anos]
+                    fig_evo.add_trace(go.Scatter(
+                        x=[str(a) for a in avg_anos], y=avg_vals,
+                        mode="lines", name="Média (selecionadas)",
+                        line=dict(color="#6b7280", width=2, dash="dash"),
+                    ))
+
+                    fig_evo.update_layout(
+                        title=dict(text=f"{metric_evo} — Evolução Comparativa",
+                                   font=dict(size=16, color="#111827")),
+                        template="plotly_white", paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="#ffffff", height=500,
+                        xaxis=dict(gridcolor="#e5e7eb"),
+                        yaxis=dict(gridcolor="#e5e7eb",
+                                   title="%" if "%" in metric_evo else "x" if "/" in metric_evo else "R$ mi"),
+                        hovermode="x unified",
+                        legend=dict(orientation="h", y=1.15),
+                    )
+                    st.plotly_chart(fig_evo, use_container_width=True)
+                    st.caption("⚠️ A linha tracejada 'Média (selecionadas)' é a média aritmética das empresas que você digitou acima, "
+                               "não a média do setor. Para comparação setorial, inclua as principais empresas do setor.")
+
+                    # Tabela
+                    evo_table = pd.DataFrame(evo_data).T
+                    evo_table.index.name = "Empresa"
+                    display_evo = evo_table.copy()
+                    for col in display_evo.columns:
+                        display_evo[col] = display_evo[col].apply(
+                            lambda x: f"{x:,.1f}" if pd.notna(x) else "—"
+                        )
+                    st.dataframe(display_evo, use_container_width=True)
+                else:
+                    st.warning("Nenhum dado encontrado.")
 
     with tab_raw:
         st.markdown("### Dados brutos da CVM")
