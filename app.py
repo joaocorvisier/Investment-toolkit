@@ -20,7 +20,6 @@ from plotly.subplots import make_subplots
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-import feedparser
 import warnings
 import numpy as np
 
