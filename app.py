@@ -1064,7 +1064,7 @@ elif page == "📐 Renda Fixa":
     ])
 
     if not PYETTJ_OK:
-        st.error("Biblioteca `pyettj` não instalada. Rode: `pip install pyettj bizdays html5lib`")
+        st.error("Biblioteca `pyettj` não disponível. Curvas ETTJ desabilitadas nesta instância.")
 
     def plot_curve(curva_tipo, title, dates_list, max_anos_val):
         """Plota curva ETTJ para múltiplas datas."""
